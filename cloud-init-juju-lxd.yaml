@@ -1,10 +1,18 @@
 #cloud-config
+#
+# Container-aware cloud-init for LXD containers.
+# Differs from the VM variant (cloud-init-juju.yaml) in the following ways:
+#   - Uses classic MicroK8s (not strict) for container compatibility
+#   - Skips host-kernel operations (swap, sysctl/IPv6) since containers
+#     share the host kernel
+#   - Explicitly uses the 'dir' storage backend for nested LXD
+#   - Guards systemctl calls against services that may not exist in containers
 ---
 package_update: true
 
 snap:
   commands:
-    - snap install microk8s --channel 1.31-strict/stable
+    - snap install microk8s --classic --channel 1.31/stable
     - snap alias microk8s.kubectl kubectl
     - snap alias microk8s.kubectl k
     - snap install --classic charmcraft
@@ -18,32 +26,23 @@ runcmd:
   - DEBIAN_FRONTEND=noninteractive apt-get -y autoremove
 
   - |
-    # disable swap
-    sysctl -w vm.swappiness=0
-    echo "vm.swappiness = 0" | tee -a /etc/sysctl.conf
-    swapoff -a
+    # Disable unnecessary services (guard each call — some services
+    # do not exist inside containers)
+    for svc in \
+      man-db.timer man-db.service \
+      apport.service apport-autoreport.service \
+      apt-daily.service apt-daily.timer \
+      apt-daily-upgrade.service apt-daily-upgrade.timer \
+      unattended-upgrades.service \
+      motd-news.service motd-news.timer \
+      ua-messaging.service ua-messaging.timer \
+      ua-timer.timer ua-timer.service \
+      systemd-tmpfiles-clean.timer; do
+      systemctl disable "$svc" --now 2>/dev/null || true
+    done
 
   - |
-    # disable unnecessary services
-    systemctl disable man-db.timer man-db.service --now
-    systemctl disable apport.service apport-autoreport.service  --now
-    systemctl disable apt-daily.service apt-daily.timer --now
-    systemctl disable apt-daily-upgrade.service apt-daily-upgrade.timer --now
-    systemctl disable unattended-upgrades.service --now
-    systemctl disable motd-news.service motd-news.timer --now
-    systemctl disable bluetooth.target --now
-    systemctl disable ua-messaging.service ua-messaging.timer --now
-    systemctl disable ua-timer.timer ua-timer.service --now
-    systemctl disable systemd-tmpfiles-clean.timer --now
-
-    # Disable IPv6
-    echo "net.ipv6.conf.all.disable_ipv6=1" | tee -a /etc/sysctl.conf
-    echo "net.ipv6.conf.default.disable_ipv6=1" | tee -a /etc/sysctl.conf
-    echo "net.ipv6.conf.lo.disable_ipv6=1" | tee -a /etc/sysctl.conf
-    sysctl -p
-
-  - |
-    # set right owner to /home/ubuntu directory
+    # Set right owner to /home/ubuntu directory
     chown ubuntu:ubuntu /home/ubuntu
 
   - |
@@ -51,15 +50,17 @@ runcmd:
     sudo -u ubuntu mkdir -p /home/ubuntu/.local/share/juju
 
   - |
-    # setup charmcraft
-    lxd init --auto
+    # Setup LXD for charmcraft and Juju.
+    # Use 'dir' storage backend — it is the safest option for nested
+    # containers (zfs/btrfs need kernel modules that may not be available).
+    lxd init --auto --storage-backend=dir
     adduser ubuntu lxd
 
   - |
-    # setup microk8s
-    sudo usermod -a -G snap_microk8s ubuntu
+    # Setup microk8s (classic confinement — group is 'microk8s')
+    sudo usermod -a -G microk8s ubuntu
     sudo -u ubuntu mkdir -p /home/ubuntu/.kube
-    adduser ubuntu snap_microk8s
+
     microk8s status --wait-ready
 
     # Color codes for output
@@ -95,7 +96,7 @@ runcmd:
 
       # Check if registry is responding
       if curl -sf http://localhost:32000/v2/_catalog > /dev/null 2>&1; then
-        echo "✓ Registry is ready!"
+        echo "Registry is ready!"
         break
       fi
 
